@@ -1,0 +1,532 @@
+"""
+Battleship Game Engine
+======================
+Modular engine supporting Human vs Human, Human vs AI, or AI vs AI.
+
+Usage:
+    python battleship.py
+
+Ships:
+    Carrier      (5), Battleship (4), Cruiser (3), Submarine (3), Destroyer (2)
+
+Coordinates:
+    Columns: A-J  |  Rows: 1-10  (e.g. B5, J10)
+"""
+
+import random
+import os
+import time
+from abc import ABC, abstractmethod
+from typing import Optional
+
+# ─────────────────────────────────────────────
+#  Constants
+# ─────────────────────────────────────────────
+
+GRID_SIZE = 10
+COLS = "ABCDEFGHIJ"
+ROWS = list(range(1, GRID_SIZE + 1))
+
+SHIPS = [
+    ("Carrier",    5),
+    ("Battleship", 4),
+    ("Cruiser",    3),
+    ("Submarine",  3),
+    ("Destroyer",  2),
+]
+
+# Cell states
+EMPTY   = "."
+SHIP    = "S"   # hidden from opponent
+HIT     = "X"
+MISS    = "O"
+SUNK    = "#"
+
+# CLI colours (fall back gracefully if unsupported)
+R  = "\033[91m"   # red
+G  = "\033[92m"   # green
+Y  = "\033[93m"   # yellow
+B  = "\033[94m"   # blue
+DIM = "\033[2m"
+RST = "\033[0m"
+
+
+# ─────────────────────────────────────────────
+#  Grid / Board
+# ─────────────────────────────────────────────
+
+class Board:
+    """Represents one player's 10x10 grid."""
+
+    def __init__(self, owner_name: str):
+        self.owner = owner_name
+        self.grid: list[list[str]] = [[EMPTY]*GRID_SIZE for _ in range(GRID_SIZE)]
+        self.ships: list[dict] = []          # placed ship records
+        self.shots_received: set[tuple] = set()
+
+    # ── Coordinate helpers ──────────────────
+
+    @staticmethod
+    def parse(coord: str) -> tuple[int, int]:
+        """Parse 'B5' → (col_idx, row_idx). Raises ValueError on bad input."""
+        coord = coord.strip().upper()
+        if len(coord) < 2:
+            raise ValueError(f"Invalid coordinate: {coord!r}")
+        col_ch = coord[0]
+        row_s  = coord[1:]
+        if col_ch not in COLS:
+            raise ValueError(f"Column must be A-J, got {col_ch!r}")
+        try:
+            row = int(row_s)
+        except ValueError:
+            raise ValueError(f"Row must be 1-10, got {row_s!r}")
+        if row not in ROWS:
+            raise ValueError(f"Row must be 1-10, got {row}")
+        return COLS.index(col_ch), row - 1
+
+    @staticmethod
+    def format(col: int, row: int) -> str:
+        return f"{COLS[col]}{row+1}"
+
+    # ── Ship placement ──────────────────────
+
+    def can_place(self, col: int, row: int, length: int, horizontal: bool) -> bool:
+        for i in range(length):
+            c = col + (i if horizontal else 0)
+            r = row + (0 if horizontal else i)
+            if not (0 <= c < GRID_SIZE and 0 <= r < GRID_SIZE):
+                return False
+            if self.grid[r][c] != EMPTY:
+                return False
+        return True
+
+    def place_ship(self, name: str, col: int, row: int, length: int, horizontal: bool):
+        cells = []
+        for i in range(length):
+            c = col + (i if horizontal else 0)
+            r = row + (0 if horizontal else i)
+            self.grid[r][c] = SHIP
+            cells.append((c, r))
+        self.ships.append({"name": name, "length": length,
+                            "cells": cells, "hits": set(), "sunk": False})
+
+    def place_ship_random(self, name: str, length: int):
+        while True:
+            h   = random.choice([True, False])
+            col = random.randint(0, GRID_SIZE - 1)
+            row = random.randint(0, GRID_SIZE - 1)
+            if self.can_place(col, row, length, h):
+                self.place_ship(name, col, row, length, h)
+                return
+
+    def place_all_random(self):
+        for name, length in SHIPS:
+            self.place_ship_random(name, length)
+
+    # ── Receiving a shot ────────────────────
+
+    def receive_shot(self, col: int, row: int) -> str:
+        """Process an incoming shot. Returns 'hit', 'miss', or 'sunk:<ShipName>'."""
+        if (col, row) in self.shots_received:
+            return "duplicate"
+        self.shots_received.add((col, row))
+
+        cell = self.grid[row][col]
+        if cell in (EMPTY, MISS):
+            self.grid[row][col] = MISS
+            return "miss"
+
+        if cell in (SHIP, HIT):
+            self.grid[row][col] = HIT
+            for ship in self.ships:
+                if (col, row) in ship["cells"]:
+                    ship["hits"].add((col, row))
+                    if ship["hits"] == set(ship["cells"]):
+                        ship["sunk"] = True
+                        # mark all cells as SUNK
+                        for c2, r2 in ship["cells"]:
+                            self.grid[r2][c2] = SUNK
+                        return f"sunk:{ship['name']}"
+                    return "hit"
+        return "miss"   # fallback
+
+    def all_sunk(self) -> bool:
+        return all(s["sunk"] for s in self.ships)
+
+    # ── Display ─────────────────────────────
+
+    def render(self, hide_ships: bool = False) -> str:
+        """Return a string representation of the board."""
+        header  = f"  {'  '.join(COLS)}"
+        lines   = [header]
+        for r in range(GRID_SIZE):
+            row_label = f"{r+1:>2}"
+            cells = []
+            for c in range(GRID_SIZE):
+                ch = self.grid[r][c]
+                if hide_ships and ch == SHIP:
+                    ch = EMPTY
+                cells.append(self._colour(ch))
+            lines.append(f"{row_label} {' '.join(cells)}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _colour(ch: str) -> str:
+        if ch == HIT:  return f"{R}{ch}{RST}"
+        if ch == SUNK: return f"{R}{ch}{RST}"
+        if ch == MISS: return f"{DIM}{ch}{RST}"
+        if ch == SHIP: return f"{G}{ch}{RST}"
+        return ch
+
+
+# ─────────────────────────────────────────────
+#  Player ABC
+# ─────────────────────────────────────────────
+
+class Player(ABC):
+    """Abstract base – subclass for Human or any AI agent."""
+
+    def __init__(self, name: str):
+        self.name  = name
+        self.board = Board(name)          # own ships live here
+        self.tracking_grid = Board(f"{name}_track")  # shots fired at opponent
+
+    @abstractmethod
+    def place_ships(self):
+        """Populate self.board with ships."""
+        ...
+
+    @abstractmethod
+    def choose_shot(self) -> tuple[int, int]:
+        """Return (col, row) to fire at. Must not already have been shot."""
+        ...
+
+    def record_shot_result(self, col: int, row: int, result: str):
+        """Engine calls this after the shot so the player can update its tracking."""
+        if result == "miss":
+            self.tracking_grid.grid[row][col] = MISS
+        elif result.startswith("sunk"):
+            self.tracking_grid.grid[row][col] = SUNK
+        else:
+            self.tracking_grid.grid[row][col] = HIT
+
+
+# ─────────────────────────────────────────────
+#  Human Player
+# ─────────────────────────────────────────────
+
+class HumanPlayer(Player):
+
+    def place_ships(self):
+        clear()
+        print(f"\n{'═'*40}")
+        print(f"  {self.name} – SHIP PLACEMENT")
+        print(f"{'═'*40}")
+        print("Options:  [R] Random  |  [M] Manual\n")
+        choice = input("Choose placement mode: ").strip().upper()
+        if choice == "M":
+            self._manual_placement()
+        else:
+            self.board.place_all_random()
+            print(f"\n{G}Ships placed randomly!{RST}")
+            print(self.board.render(hide_ships=False))
+            input("\nPress Enter to continue…")
+
+    def _manual_placement(self):
+        self.board = Board(self.name)   # reset
+        for name, length in SHIPS:
+            while True:
+                clear()
+                print(self.board.render(hide_ships=False))
+                print(f"\nPlacing {Y}{name}{RST} (length {length})")
+                try:
+                    coord  = input("  Start coordinate (e.g. B5): ")
+                    col, row = Board.parse(coord)
+                    orient = input("  Orientation (H)orizontal / (V)ertical: ").strip().upper()
+                    horiz  = orient.startswith("H")
+                    if not self.board.can_place(col, row, length, horiz):
+                        print(f"{R}Cannot place there – out of bounds or overlapping.{RST}")
+                        input("Press Enter to retry…")
+                        continue
+                    self.board.place_ship(name, col, row, length, horiz)
+                    break
+                except ValueError as e:
+                    print(f"{R}{e}{RST}")
+                    input("Press Enter to retry…")
+        clear()
+        print(self.board.render(hide_ships=False))
+        input("\nAll ships placed! Press Enter to continue…")
+
+    def choose_shot(self) -> tuple[int, int]:
+        while True:
+            try:
+                raw = input(f"  {self.name}, enter coordinate to fire (e.g. C7): ")
+                col, row = Board.parse(raw)
+                if (col, row) in self.tracking_grid.shots_received:
+                    print(f"{Y}  Already fired there – pick another.{RST}")
+                    continue
+                # Mark as a shot in our tracking set
+                self.tracking_grid.shots_received.add((col, row))
+                return col, row
+            except ValueError as e:
+                print(f"{R}  {e}{RST}")
+
+
+# ─────────────────────────────────────────────
+#  AI Agents
+# ─────────────────────────────────────────────
+
+class RandomAI(Player):
+    """Fires at completely random, un-shot cells."""
+
+    def place_ships(self):
+        self.board.place_all_random()
+
+    def choose_shot(self) -> tuple[int, int]:
+        while True:
+            col = random.randint(0, GRID_SIZE - 1)
+            row = random.randint(0, GRID_SIZE - 1)
+            if (col, row) not in self.tracking_grid.shots_received:
+                self.tracking_grid.shots_received.add((col, row))
+                return col, row
+
+
+class HunterAI(Player):
+    """
+    Hunt/Target AI:
+    - In HUNT mode fires in a checkerboard pattern to maximise coverage.
+    - When a hit lands, switches to TARGET mode and probes adjacent cells
+      until the ship is sunk, then returns to HUNT.
+    """
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self._mode       = "hunt"
+        self._hit_stack  : list[tuple[int,int]] = []   # cells to probe
+        self._last_hit   : Optional[tuple[int,int]] = None
+        self._hunt_cells : list[tuple[int,int]] = self._checkerboard()
+
+    @staticmethod
+    def _checkerboard() -> list[tuple[int,int]]:
+        cells = [(c, r) for r in range(GRID_SIZE)
+                          for c in range(GRID_SIZE)
+                          if (c + r) % 2 == 0]
+        random.shuffle(cells)
+        # Append the remaining cells as fallback
+        rest  = [(c, r) for r in range(GRID_SIZE)
+                          for c in range(GRID_SIZE)
+                          if (c + r) % 2 == 1]
+        random.shuffle(rest)
+        return cells + rest
+
+    def place_ships(self):
+        self.board.place_all_random()
+
+    def choose_shot(self) -> tuple[int, int]:
+        while True:
+            if self._mode == "target" and self._hit_stack:
+                col, row = self._hit_stack.pop()
+            else:
+                self._mode = "hunt"
+                col, row = self._hunt_cells.pop(0)
+
+            if (col, row) not in self.tracking_grid.shots_received:
+                self.tracking_grid.shots_received.add((col, row))
+                return col, row
+
+    def record_shot_result(self, col: int, row: int, result: str):
+        super().record_shot_result(col, row, result)
+        if result == "miss":
+            pass
+        elif result.startswith("sunk"):
+            self._mode = "hunt"
+            self._hit_stack.clear()
+        else:   # hit
+            self._mode = "target"
+            self._last_hit = (col, row)
+            for dc, dr in [(0,-1),(0,1),(-1,0),(1,0)]:
+                nc, nr = col+dc, row+dr
+                if (0 <= nc < GRID_SIZE and 0 <= nr < GRID_SIZE
+                        and (nc, nr) not in self.tracking_grid.shots_received):
+                    self._hit_stack.append((nc, nr))
+
+
+# ─────────────────────────────────────────────
+#  Game Engine
+# ─────────────────────────────────────────────
+
+class GameEngine:
+
+    def __init__(self, player1: Player, player2: Player, ai_delay: float = 0.6):
+        self.players   = [player1, player2]
+        self.ai_delay  = ai_delay   # pause (s) between AI moves for readability
+        self.turn      = 0
+        self.winner    : Optional[Player] = None
+
+    # ── Setup ───────────────────────────────
+
+    def setup(self):
+        for p in self.players:
+            p.place_ships()
+
+    # ── Main loop ───────────────────────────
+
+    def run(self):
+        self.setup()
+        while True:
+            attacker = self.players[self.turn % 2]
+            defender = self.players[(self.turn + 1) % 2]
+
+            self._show_boards(attacker, defender)
+            col, row, result = self._do_turn(attacker, defender)
+            self._announce(attacker, col, row, result)
+
+            if defender.board.all_sunk():
+                self.winner = attacker
+                self._game_over()
+                return
+
+            self.turn += 1
+
+    # ── Turn execution ──────────────────────
+
+    def _do_turn(self, attacker: Player, defender: Player):
+        is_human = isinstance(attacker, HumanPlayer)
+        if not is_human:
+            time.sleep(self.ai_delay)
+        col, row = attacker.choose_shot()
+        result   = defender.board.receive_shot(col, row)
+        attacker.record_shot_result(col, row, result)
+        return col, row, result
+
+    # ── Display helpers ─────────────────────
+
+    def _show_boards(self, attacker: Player, defender: Player):
+        clear()
+        is_human = isinstance(attacker, HumanPlayer)
+        sep = "─" * 45
+
+        print(f"\n{'═'*45}")
+        print(f"  Turn {self.turn+1}  –  {Y}{attacker.name}{RST} fires!")
+        print(f"{'═'*45}\n")
+
+        # Tracking grid (what attacker knows about defender)
+        print(f"  ► {attacker.name}'s TRACKING BOARD  (shots at {defender.name})")
+        print(_indent(attacker.tracking_grid.render(hide_ships=False), 4))
+
+        # Own board (only shown to human)
+        if is_human:
+            print(f"\n  ► Your OWN board")
+            print(_indent(attacker.board.render(hide_ships=False), 4))
+
+        print()
+        _ship_status(defender)
+        print()
+
+    @staticmethod
+    def _announce(attacker: Player, col: int, row: int, result: str):
+        coord = Board.format(col, row)
+        if result == "miss":
+            print(f"  {DIM}{attacker.name} fires at {coord} → MISS{RST}")
+        elif result == "hit":
+            print(f"  {Y}{attacker.name} fires at {coord} → HIT!{RST}")
+        elif result.startswith("sunk"):
+            ship_name = result.split(":")[1]
+            print(f"  {R}{attacker.name} fires at {coord} → HIT & SUNK {ship_name}!{RST}")
+        time.sleep(0.8 if isinstance(attacker, HumanPlayer) else 0.4)
+
+    def _game_over(self):
+        clear()
+        loser = [p for p in self.players if p is not self.winner][0]
+        print(f"\n{'═'*45}")
+        print(f"  {G}🎉  {self.winner.name} WINS!  🎉{RST}")
+        print(f"{'═'*45}")
+        print(f"\n  After {self.turn+1} turns, all of {loser.name}'s ships were sunk.\n")
+        print(f"  Final board – {loser.name}:")
+        print(_indent(loser.board.render(hide_ships=False), 4))
+        print()
+
+
+# ─────────────────────────────────────────────
+#  Utilities
+# ─────────────────────────────────────────────
+
+def clear():
+    os.system("cls" if os.name == "nt" else "clear")
+
+def _indent(text: str, n: int) -> str:
+    pad = " " * n
+    return "\n".join(pad + line for line in text.splitlines())
+
+def _ship_status(player: Player):
+    print(f"  {player.name}'s remaining ships:")
+    for ship in player.board.ships:
+        hp    = len(ship["cells"]) - len(ship["hits"])
+        state = f"{R}SUNK{RST}" if ship["sunk"] else f"{G}afloat ({hp} hp){RST}"
+        print(f"    {ship['name']:<12} {state}")
+
+
+# ─────────────────────────────────────────────
+#  Main Menu
+# ─────────────────────────────────────────────
+
+def build_player(slot: int) -> Player:
+    print(f"\n  Player {slot}:")
+    print("    [1] Human")
+    print("    [2] Random AI")
+    print("    [3] Hunter AI  (recommended)")
+    choice = input(f"  Select type for Player {slot}: ").strip()
+    name   = input(f"  Name for Player {slot}: ").strip() or f"Player{slot}"
+
+    if choice == "1":
+        return HumanPlayer(name)
+    elif choice == "2":
+        return RandomAI(name)
+    else:
+        return HunterAI(name)
+
+def main():
+    clear()
+    print(f"""
+{'═'*45}
+    ██████╗  █████╗ ████████╗████████╗
+    ██╔══██╗██╔══██╗╚══██╔══╝╚══██╔══╝
+    ██████╔╝███████║   ██║      ██║
+    ██╔══██╗██╔══██║   ██║      ██║
+    ██████╔╝██║  ██║   ██║      ██║
+    ╚═════╝ ╚═╝  ╚═╝   ╚═╝      ╚═╝
+    ██╗     ███████╗ ██╗ ██╗████████╗███████╗
+    ╚██╗   ██╔════╝ ██║ ██║╚══██╔══╝██╔════╝
+     ╚██╗ ██║  ███╗ ███████║   ██║   ███████╗
+      ╚██╗██║   ██║ ██╔══██║   ██║        ██║
+       ╚████║╚███████╗██║  ██║  ██║   ███████║
+        ╚═══╝ ╚══════╝╚═╝  ╚═╝  ╚═╝   ╚══════╝
+{'═'*45}
+  Legend:  {G}S{RST}=ship  {R}X{RST}=hit  {DIM}O{RST}=miss  {R}#{RST}=sunk
+{'═'*45}
+""")
+
+    print("  Configure your game:\n")
+    p1 = build_player(1)
+    p2 = build_player(2)
+
+    delay = 0.6
+    if not isinstance(p1, HumanPlayer) and not isinstance(p2, HumanPlayer):
+        raw = input("\n  AI vs AI – delay between moves in seconds [0.6]: ").strip()
+        try:
+            delay = float(raw) if raw else 0.6
+        except ValueError:
+            delay = 0.6
+
+    engine = GameEngine(p1, p2, ai_delay=delay)
+    engine.run()
+
+    again = input("\n  Play again? (y/n): ").strip().lower()
+    if again == "y":
+        main()
+    else:
+        print("\n  Thanks for playing Battleship! 🚢\n")
+
+
+if __name__ == "__main__":
+    main()
